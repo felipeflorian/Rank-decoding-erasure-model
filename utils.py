@@ -1,9 +1,14 @@
 from sage.matrix.matrix_space import MatrixSpace
-from sage.all import GF,  vector, identity_matrix, ceil, VectorSpace, matrix
+from sage.all import GF, vector, identity_matrix, ceil, VectorSpace, matrix
 import itertools
-from sage.all import GF,  vector, identity_matrix, ceil, VectorSpace, matrix
-from sage.matrix.matrix_space import MatrixSpace
 import random 
+
+def serialize_element_to_bits(el, V_Fq):
+    """
+    Global helper function to map an Fqm extension element into its 
+    standard Fq coefficient vector bit list.
+    """
+    return [int(bit) for bit in V_Fq(el)]
 
 def full_entry_ap_decoder_module(H, s, J, a_J, q, m, n, k, B_hyb=1):
     """
@@ -11,7 +16,7 @@ def full_entry_ap_decoder_module(H, s, J, a_J, q, m, n, k, B_hyb=1):
     """
     Fq = GF(q)
     Fqm = H.base_ring()
-    V_Fq = Fqm.vector_space()
+    V_Fq = Fqm.vector_space(map=False)
     
     # -------------------------------------------------------------
     # Input Normalization & Feasibility Check
@@ -219,33 +224,26 @@ def full_entry_ap_decoder_module(H, s, J, a_J, q, m, n, k, B_hyb=1):
 
 def compute_bitwise_posteriors(obs_bit, rho, alpha=0.01, beta=0.20):
     """
-    Calculates bit-level posterior probabilities exactly as written in 
-    the provided formula image using Bayes' rule under a uniform coordinate prior.
+    Calculates bit-level posterior probabilities matching the mathematical 
+    formulas derived under Bayes' rule under a uniform coordinate prior.
     """
     if obs_bit == 0:
-        # Top half of the image formulas (If x_tilde_i = 0)
         denom = (1.0 - alpha) * (1.0 - rho) + beta * rho
         p_0 = ((1.0 - alpha) * (1.0 - rho)) / denom
         p_1 = (beta * rho) / denom
     else:
-        # Bottom half of the image formulas (If x_tilde_i = 1)
         denom = alpha * (1.0 - rho) + (1.0 - beta) * rho
         p_0 = (alpha * (1.0 - rho)) / denom
         p_1 = ((1.0 - beta) * rho) / denom
         
     return p_0, p_1
 
-
 def simulate_and_analyze_leakage(E, Fqm, r, q, m, n, alpha=0.01, beta=0.20):
     """
     Simulates asymmetric cold-boot bit leakage over the coordinates of the matrix E
     and computes full extension-field entry posteriors using bitwise factorization.
-    
-    Arguments:
-    ----------
-    E : An m x n Matrix over the base field Fq (The true secret error matrix)
     """
-    V_Fq = Fqm.vector_space()
+    V_Fq = Fqm.vector_space(map=False)
     Fq = GF(q)
     
     # Calculate global prior rho = target_rank_weight / code_length as specified
@@ -273,7 +271,6 @@ def simulate_and_analyze_leakage(E, Fqm, r, q, m, n, alpha=0.01, beta=0.20):
         e_tilde_list.append(Fqm(observed_bits))
         
     E_tilde_vector = vector(Fqm, e_tilde_list)
-    # Correctly build the m x n base field matrix from the corrupted rows
     E_tilde_matrix = matrix(Fq, bit_leakage_matrix).transpose()
     
     # --- Step B: Calculate Entry-Wise Posteriors and Sort Columns ---
@@ -300,5 +297,62 @@ def simulate_and_analyze_leakage(E, Fqm, r, q, m, n, alpha=0.01, beta=0.20):
     column_scores = [(j, max(posteriors[j].values())) for j in range(n)]
     sorted_cols = sorted(column_scores, key=lambda x: x[1], reverse=True)
     
-    # Returns exactly 4 values to match your unpacked sequence
     return E_tilde_vector, E_tilde_matrix, posteriors, sorted_cols
+
+def execute_and_verify_ap_instance(instance_data, J, a_J):
+    """
+    Orchestrates structural unpacking, runs Algorithm 5 explicitly given 
+    the picked indices J and known column field elements a_J, and validates 
+    results using explicit structural rank and syndrome checks.
+    """
+    params = instance_data["parameters"]
+    q, m, n, k, r = params["q"], params["m"], params["n"], params["k"], params["r"]
+    n_minus_k = n - k
+    
+    Fq = GF(q)
+    Fqm = GF(q**m, name='z')
+    V_Fq = Fqm.vector_space(map=False)
+    
+    # Rebuild H Matrix from stored bit representation
+    H_rows = []
+    for i in range(n_minus_k):
+        row_elements = [Fqm(V_Fq(vector(Fq, instance_data["H"][i][j]))) for j in range(n)]
+        H_rows.append(row_elements)
+    H = matrix(Fqm, H_rows)
+    
+    # Rebuild Syndrome Vector s
+    s = vector(Fqm, [Fqm(V_Fq(vector(Fq, instance_data["s"][i]))) for i in range(n_minus_k)])
+    
+    # Rebuild True Error Vector for validation verification
+    e_secret = vector(Fqm, [Fqm(V_Fq(vector(Fq, instance_data["e"][j]))) for j in range(n)])
+    
+    # Trigger Decoder Execution using the passed J and a_J arguments
+    candidate_list = full_entry_ap_decoder_module(H, s, J, a_J, q, m, n, k)
+    print(f"Number of candidates returned: {len(candidate_list)}")
+
+    # Final Verification
+    success = False
+    recovered_e_serialized = None
+    
+    for idx, candidate in enumerate(candidate_list):
+        syndrome_check = (H * candidate == s)
+        cand_matrix = matrix(Fq, [V_Fq(el) for el in candidate]).transpose()
+        rank_check = (cand_matrix.rank() == r)
+        
+        if syndrome_check and rank_check:
+            print(f"[+] Candidate #{idx+1} passes validation filters.")
+            if candidate == e_secret:
+                print("[++++] SUCCESS: Reconstructed vector matches the secret error exactly!")
+                success = True
+                # Serialize the successfully recovered candidate vector back into binary bits
+                recovered_e_serialized = [[int(bit) for bit in V_Fq(el)] for el in candidate]
+                break
+                
+    return {
+        "success": success,
+        "parameters": {"n": n, "k": k, "r": r, "m": m},
+        "erasures_used": J,
+        "candidates_found": len(candidate_list),
+        "recovered_e": recovered_e_serialized,
+        "original_e": instance_data["e"]
+    }
