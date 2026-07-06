@@ -1,5 +1,5 @@
 from sage.matrix.matrix_space import MatrixSpace
-from sage.all import GF, vector, identity_matrix, ceil, VectorSpace, matrix
+from sage.all import GF, vector, identity_matrix, ceil, VectorSpace, matrix, PolynomialRing, Integer
 import itertools
 import random 
 
@@ -299,6 +299,212 @@ def simulate_and_analyze_leakage(E, Fqm, r, q, m, n, alpha=0.01, beta=0.20):
     
     return E_tilde_vector, E_tilde_matrix, posteriors, sorted_cols
 
+def grs_scalar_erasures(q, m, n, d, support_basis, Fqm, H, s, T, a_T, r, B_rec=128):
+    
+    """
+        GRS Scalar Erasures Decoder (Algorithm 2: GRS Reconstruction with Scalar Erasures).
+    
+        This module builds a base-field linear system of equations combining extension-field 
+        syndrome constraints and side-channel scalar erasures, verifies system consistency, 
+        reconstructs potential solutions, and applies local rank filtering.
+    
+        Parameters:
+        -----------
+        q : int
+            The size of the base field GF(q).
+        m : int
+            The extension degree defining the extension field GF(q^m) over GF(q).
+        n : int
+            The block length of the rank-metric code.
+        d : int
+            The dimension of the candidate super-support space.
+        support_basis : list
+            A list of d elements from GF(q^m) forming a basis for the super-support space.
+        Fqm : FiniteField
+            The SageMath extension field object instance representing GF(q^m).
+        H : Matrix
+            The (n - k) x n parity-check matrix of the code over GF(q^m).
+        s : Vector
+            The syndrome vector of length (n - k) over GF(q^m).
+        T : list of tuples
+            The set of leaked/guessed side-channel coordinate positions (column_index, bit_position).
+        a_T : dict
+            A dictionary mapping each coordinate pair in T to its respective leaked base-field bit value.
+        r : int
+            The target rank weight parameter used for filtering final candidates.
+        B_rec : int, optional
+            The maximum solution reconstruction budget cap for enumeration (default: 128).
+    
+        Returns:
+        --------
+        E_F : list
+            A list containing all reconstructed error candidate vectors matching rank r.
+        equations : list
+            A list of compiled linear polynomial expressions expanded over the base field.
+        beta_matrix : list of lists
+            The structured matrix holding pointers to the multivariate polynomial variables.
+        R_poly : PolynomialRing
+            The underlying multivariate polynomial ring over GF(q^m) used for symbol tracking.
+    """
+    
+    E_F = []
+    
+    # Introduce algebraic variables over Fqm to facilitate direct multiplication
+    var_names = [f"beta_{lambda_}_{j}" for lambda_ in range(1, d + 1) for j in range(1, n + 1)]
+    R_poly = PolynomialRing(Fqm, var_names)
+    betas = R_poly.gens()
+    
+    # Map flat variables to a d x n list structure matching \beta_{\lambda, j}
+    beta_matrix = [[betas[(lambda_ * n) + j] for j in range(n)] for lambda_ in range(d)]
+    
+    # define: e_j = \sum \beta_{\lambda, j} * f_{\lambda}
+    e = []
+    for j in range(n):
+        e_j = sum(beta_matrix[lambda_][j] * support_basis[lambda_] for lambda_ in range(d))
+        e.append(e_j)
+        
+    equations = []
+    Fq = GF(q)
+    V_Fq = Fqm.vector_space(map=False)
+    
+    # Compute H * e(\beta)^\top - s^\top = 0
+    n_minus_k = H.nrows()
+    for i in range(n_minus_k):
+        
+        # Compute syndrome equations over extension field F_q^m
+        syndrome_eq = sum(H[i, j] * e[j] for j in range(n)) - s[i]
+
+        # splits the syndrome equation in the extension field into m separate F_q equations
+        for pos in range(m): 
+            fq_expr = R_poly(0) #initialize polynomial as 0
+            
+            for lambda_ in range(d):
+                for j in range(n):
+                    
+                    # split the polynomial into vector components
+                    # extract the extension field coefficient of the variable
+                    coeff = syndrome_eq.coefficient(beta_matrix[lambda_][j]) 
+                    if coeff != 0:
+                        # converts coefficient into a vector over F_q
+                        fq_coeff = Fq(V_Fq(Fqm(coeff))[pos])
+                        fq_expr += fq_coeff * beta_matrix[lambda_][j]
+            
+            # Extract base field part of the constant term
+            const_term = syndrome_eq.constant_coefficient()
+            if const_term != 0:
+                
+                # extract the field component of the syndrome constant
+                fq_expr += Fq(V_Fq(Fqm(const_term))[pos])
+                
+            equations.append(fq_expr) 
+
+            
+    for (j, ell) in T:
+        val_erasure = R_poly(0)
+        for lambda_ in range(d):
+            val = Fq(V_Fq(support_basis[lambda_])[ell])
+            val_erasure += val * beta_matrix[lambda_][j] 
+            
+        # Subtract the target leakage hint to set the expression equal to 0
+        hint = Fq(a_T[(j, ell)])
+        val_erasure -= hint
+        
+        equations.append(val_erasure)
+
+    
+    # Convert the polynomial equations into an explicit matrix system A * beta = b
+    num_vars = d * n
+    A_list = []
+    b_list = []
+    
+    for eq in equations:
+        row_coeffs = []
+        for lambda_ in range(d):
+            for j in range(n):
+                
+                # Extract numerical coefficient from polynomial
+                row_coeffs.append(Fq(eq.coefficient(beta_matrix[lambda_][j])))
+        A_list.append(row_coeffs)
+        
+        # val syndrome
+        b_list.append(-Fq(eq.constant_coefficient()))
+        
+    A = matrix(Fq, A_list)
+    b = vector(Fq, b_list)
+    
+
+    matrix_aug = A.augment(b)
+    if A.rank() != matrix_aug.rank(): 
+        print("System is inconsistent. Returning empty list E_F.")
+        return E_F, equations, beta_matrix, R_poly
+
+
+    # Find a particular solution and the kernel
+    particular_sol = A.solve_right(b)
+    kernel_basis = A.right_kernel().basis() #
+    num_free_vars = len(kernel_basis)
+    
+    # q^num_free_vars total of solutions
+    total_solutions = min(q^num_free_vars, B_rec) 
+    print(f"[+] Step 8: System has {num_free_vars} free variables. Enumerating up to {total_solutions} solutions.")
+    
+    raw_candidates = []
+    
+    # Loop over binary representation of integers up to total_solutions to mix kernel combinations
+    for idx in range(total_solutions):
+        
+        current_sol = particular_sol
+        
+        # Convert integer to base-q digit representations to pick free variable coefficients
+        digits = Integer(idx).digits(base=q)
+        digits += [0] * (num_free_vars - len(digits))
+        
+        for k_idx, scalar in enumerate(digits):
+            current_sol += Fq(scalar) * kernel_basis[k_idx]
+            
+        sol_e = []
+        for j in range(n):
+            # Compute e_j = \sum \beta_{\lambda, j} * f_{\lambda} using the numerical solution
+            e_j_val = sum(current_sol[lambda_ * n + j] * support_basis[lambda_] for lambda_ in range(d))
+            sol_e.append(e_j_val)
+            
+        raw_candidates.append(vector(Fqm, sol_e))
+        
+    # Filter the candidates by those who has rank r
+    for candidate_vector in raw_candidates:
+        
+        # Convert the extension field elements into columns of a base-field matrix
+        matrix_representation = matrix(Fq, [V_Fq(element) for element in candidate_vector]).transpose()
+        if matrix_representation.rank() == r:
+            E_F.append(candidate_vector)
+            
+    return E_F, equations, beta_matrix, R_poly
+
+def verify_decoder_candidates(E_F, H, s, r, Fqm):
+    """
+    Validates all candidate error vectors recovered by the decoder of GRS scalar erasure.
+    Checks syndrome consistency and global rank metrics over the base field field.
+    """
+    Fq = H.base_ring().base_ring()
+    V_Fq = Fqm.vector_space(map=False)
+    valid_solutions = []
+
+    
+    for idx, candidate in enumerate(E_F):
+        syndrome_check = (H * candidate == s)
+        
+        matrix_rep = matrix(Fq, [V_Fq(element) for element in candidate]).transpose()
+        rank_check = (matrix_rep.rank() == r)
+        
+        if syndrome_check and rank_check:
+            valid_solutions.append(candidate)
+        else:
+            reasons = []
+            if not syndrome_check: reasons.append("Syndrome Mismatch")
+            if not rank_check: reasons.append(f"Rank Weight is {matrix_rep.rank()} (Expected {r})")
+            
+    return valid_solutions
+
 def execute_and_verify_ap_instance(instance_data, J, a_J):
     """
     Orchestrates structural unpacking, runs Algorithm 5 explicitly given 
@@ -342,7 +548,7 @@ def execute_and_verify_ap_instance(instance_data, J, a_J):
         if syndrome_check and rank_check:
             print(f"[+] Candidate #{idx+1} passes validation filters.")
             if candidate == e_secret:
-                print("[++++] SUCCESS: Reconstructed vector matches the secret error exactly!")
+                print("Reconstructed vector matches the secret error exactly!")
                 success = True
                 # Serialize the successfully recovered candidate vector back into binary bits
                 recovered_e_serialized = [[int(bit) for bit in V_Fq(el)] for el in candidate]
