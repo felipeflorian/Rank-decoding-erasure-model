@@ -1,7 +1,8 @@
 from sage.matrix.matrix_space import MatrixSpace
-from sage.all import GF, vector, identity_matrix, ceil, VectorSpace, matrix, PolynomialRing, Integer, floor, ceil, log
+from sage.all import GF, vector, identity_matrix, ceil, VectorSpace, matrix, PolynomialRing, Integer, floor, ceil, log, codes
 import itertools
 import random 
+from sage.coding.gabidulin_code import GabidulinCode
 
 def serialize_element_to_bits(el, V_Fq):
     """
@@ -712,3 +713,124 @@ def ap_erasure_decoder_module(q, m, n, k, r, J, a_J, H=None, s=None, G=None, y=N
                 E_out.append(cand_vec)
                 
     return E_out
+
+def full_entry_residual_reduction_module(q, m, n, k, r, J, a_J, H=None, s=None, G=None, y=None, B_rec=128):
+    """
+    Algorithm 4: Full-Entry Residual Reduction Module.
+    
+    Punctures the parity-check matrix and modifies the syndrome using known 
+    column erasures, iterates through valid residual rank weights, and decodes 
+    the shortened instance using SageMath's Gabidulin decoder.
+    """
+    Fq = GF(q)
+    
+    
+    E_entry = []
+    
+    if H is not None and s is not None:
+        Fqm = H.base_ring()
+        s = vector(Fqm, s)
+    elif G is not None and y is not None:
+        Fqm = G.base_ring()
+        y = vector(Fqm, y)
+        H = G.right_kernel().basis_matrix()
+        s = H * y
+    else:
+        raise ValueError("Decoder requires either an RSD instance (H, s) or an RD instance (G, y).")
+        
+    V_Fq = Fqm.vector_space(map=False)
+    
+    if len(a_J) > 0:
+        erasure_vectors = [V_Fq(val) for val in a_J]
+        rho_J = VectorSpace(Fq, m).subspace(erasure_vectors).dimension()
+    else:
+        rho_J = 0
+
+    # Strict structural check
+    if rho_J > r:
+        print(f"Infeasible instance. erasure subspace dimension rho_J ({rho_J}) > target rank r ({r}).")
+        return E_entry
+        
+    tau_min = max(0, r - rho_J)
+    tau_max = min(r, n - len(J))
+
+    # Check feasibility via boundaries
+    if tau_min > tau_max:
+        print(f"[-] Algorithm 4: Infeasible rank bounds. tau_min ({tau_min}) > tau_max ({tau_max}).")
+        return E_entry
+
+    Jc = [j for j in range(n) if j not in J]
+    n_prime = len(Jc)
+    
+    s_prime = s
+    for idx, col_idx in enumerate(J):
+        s_prime -= H.column(col_idx) * a_J[idx]
+        
+    H_prime = matrix(Fqm, [H.column(j) for j in Jc]).transpose()
+
+    k_prime = max(1, n_prime - H_prime.nrows())
+
+    try:
+        VS_extension = VectorSpace(Fq, m)
+        eval_pts = [Fqm(vec) for vec in VS_extension.basis()[:n_prime]]
+        residual_code = codes.GabidulinCode(Fqm, n_prime, k_prime, eval_pts)
+        gabidulin_decoder = residual_code.decoder("Gao")
+    except (AttributeError, ValueError, NameError):
+        gabidulin_decoder = None
+
+    for tau in range(tau_min, tau_max + 1):
+        if tau == 0:
+            E_res = [vector(Fqm, [0] * n_prime)]
+        elif gabidulin_decoder is not None:
+            E_res = []
+            try:
+                y_prime_res = H_prime.solve_right(s_prime)
+                
+                decoded_codeword = gabidulin_decoder.decode_to_code(y_prime_res)
+                e_short = y_prime_res - decoded_codeword
+                
+                matrix_rep = matrix(Fq, [V_Fq(el) for el in e_short]).transpose()
+                if matrix_rep.rank() == tau:
+                    E_res.append(e_short)
+            except Exception:
+                E_res = []
+        else:
+            E_res = []
+            try:
+                particular_res = H_prime.solve_right(s_prime)
+                kernel_res = H_prime.right_kernel().basis()
+                num_free_res = len(kernel_res)
+                total_res_sol = min(q^num_free_res, B_rec)
+                
+                for idx in range(total_res_sol):
+                    current_res = particular_res
+                    if num_free_res > 0:
+                        digits = Integer(idx).digits(base=q)
+                        digits += [0] * (num_free_res - len(digits))
+                        for k_idx, scalar in enumerate(digits):
+                            current_res += Fq(scalar) * kernel_res[k_idx]
+                            
+                    matrix_rep = matrix(Fq, [V_Fq(el) for el in current_res]).transpose()
+                    if matrix_rep.rank() == tau:
+                        E_res.append(current_res)
+            except ValueError:
+                E_res = []
+
+        for e_short in E_res:
+            e_full = [Fqm(0)] * n
+            
+            for short_idx, real_idx in enumerate(Jc):
+                e_full[real_idx] = e_short[short_idx]
+                
+            for erasure_idx, real_idx in enumerate(J):
+                e_full[real_idx] = a_J[erasure_idx]
+                
+            candidate_vector = vector(Fqm, e_full)
+            
+            if H * candidate_vector == s:
+                cand_matrix = matrix(Fq, [V_Fq(el) for el in candidate_vector]).transpose()
+                if cand_matrix.rank() == r:
+                    if candidate_vector not in E_entry:
+                        E_entry.append(candidate_vector)
+
+    return E_entry
