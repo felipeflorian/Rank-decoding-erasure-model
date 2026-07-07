@@ -1,5 +1,5 @@
 from sage.matrix.matrix_space import MatrixSpace
-from sage.all import GF, vector, identity_matrix, ceil, VectorSpace, matrix, PolynomialRing, Integer
+from sage.all import GF, vector, identity_matrix, ceil, VectorSpace, matrix, PolynomialRing, Integer, floor, ceil, log
 import itertools
 import random 
 
@@ -435,7 +435,6 @@ def grs_scalar_erasures(q, m, n, d, support_basis, Fqm, H, s, T, a_T, r, B_rec=1
 
     matrix_aug = A.augment(b)
     if A.rank() != matrix_aug.rank(): 
-        print("System is inconsistent. Returning empty list E_F.")
         return E_F, equations, beta_matrix, R_poly
 
 
@@ -446,7 +445,6 @@ def grs_scalar_erasures(q, m, n, d, support_basis, Fqm, H, s, T, a_T, r, B_rec=1
     
     # q^num_free_vars total of solutions
     total_solutions = min(q^num_free_vars, B_rec) 
-    print(f"[+] Step 8: System has {num_free_vars} free variables. Enumerating up to {total_solutions} solutions.")
     
     raw_candidates = []
     
@@ -454,13 +452,13 @@ def grs_scalar_erasures(q, m, n, d, support_basis, Fqm, H, s, T, a_T, r, B_rec=1
     for idx in range(total_solutions):
         
         current_sol = particular_sol
-        
+        if num_free_vars > 0:
         # Convert integer to base-q digit representations to pick free variable coefficients
-        digits = Integer(idx).digits(base=q)
-        digits += [0] * (num_free_vars - len(digits))
-        
-        for k_idx, scalar in enumerate(digits):
-            current_sol += Fq(scalar) * kernel_basis[k_idx]
+            digits = Integer(idx).digits(base=q)
+            digits += [0] * (num_free_vars - len(digits))
+            
+            for k_idx, scalar in enumerate(digits):
+                current_sol += Fq(scalar) * kernel_basis[k_idx]
             
         sol_e = []
         for j in range(n):
@@ -534,7 +532,6 @@ def execute_and_verify_ap_instance(instance_data, J, a_J):
     
     # Trigger Decoder Execution using the passed J and a_J arguments
     candidate_list = full_entry_ap_decoder_module(H, s, J, a_J, q, m, n, k)
-    print(f"Number of candidates returned: {len(candidate_list)}")
 
     # Final Verification
     success = False
@@ -546,7 +543,6 @@ def execute_and_verify_ap_instance(instance_data, J, a_J):
         rank_check = (cand_matrix.rank() == r)
         
         if syndrome_check and rank_check:
-            print(f"[+] Candidate #{idx+1} passes validation filters.")
             if candidate == e_secret:
                 print("Reconstructed vector matches the secret error exactly!")
                 success = True
@@ -562,3 +558,157 @@ def execute_and_verify_ap_instance(instance_data, J, a_J):
         "recovered_e": recovered_e_serialized,
         "original_e": instance_data["e"]
     }
+
+def _gaussian_binomial(a, b, q):
+    """ Helper function to compute the q-binomial coefficient. """
+    if b < 0 or b > a:
+        return 0
+    if b == 0 or b == a:
+        return 1
+    num = 1
+    den = 1
+    for i in range(b):
+        num *= (q^a - q^i)
+        den *= (q^b - q^i)
+    return num / den
+
+def ap_erasure_decoder_module(q, m, n, k, r, J, a_J, H=None, s=None, G=None, y=None, B_sup=None, epsilon=0.01, B_rec=128):
+    
+    """
+        Algorithm 3: AP-Erasure Decoder Module.
+        
+        This randomized decoder exploits full-entry column erasures and automatically 
+        handles dual problem formulations—Rank Syndrome Decoding (RSD) via (H, s) 
+        and Rank Decoding (RD) via (G, y). It maps full columns down to their base field 
+        bit configurations and iteratively samples random support candidates to invoke 
+        Algorithm 2 (grs_scalar_erasures) as an internal subroutine.
+    
+        Parameters:
+        -----------
+        q : int
+            The size of the base finite field field GF(q).
+        m : int
+            The algebraic extension degree defining the extension field GF(q^m) over GF(q).
+        n : int
+            The block length of the rank-metric linear code.
+        k : int
+            The dimension of the rank-metric linear code.
+        r : int
+            The exact target rank weight parameter of the hidden error vector.
+        J : list of int
+            The set containing the specific column indices where erasures/leakages occurred.
+        a_J : list of finite field elements
+            The leaked full extension field elements from GF(q^m) corresponding to the columns in J.
+        H : Matrix, optional
+            The parity-check matrix defining the RSD formulation. Required if s is provided.
+        s : Vector, optional
+            The syndrome vector defining the RSD formulation. Required if H is provided.
+        G : Matrix, optional
+            The generator matrix defining the RD formulation. Required if y is provided.
+        y : Vector, optional
+            The received word vector defining the RD formulation. Required if G is provided.
+        B_sup : int, optional
+            The structural upper bound constraint on the total number of trial iterations. 
+            If None, it is dynamically computed using q-binomial inclusion probabilities.
+        epsilon : float, optional
+            The target maximum tolerable failure probability threshold used to compute B_sup (default: 0.01).
+        B_rec : int, optional
+            The maximum solution reconstruction budget parameter forwarded to Algorithm 2 (default: 128).
+    
+        Returns:
+        --------
+        E_out : list of Vectors
+            A compiled list containing all reconstructed error candidate vectors over GF(q^m)^n 
+            that successfully satisfied the global parity-check equations and rank weight constraints.
+    """
+    
+    Fq = GF(q)
+    
+    # Variables definition for RSD problem
+    if H is not None and s is not None:
+        Fqm = H.base_ring()
+        s = vector(Fqm, s)
+        
+        if G is None:
+            G = H.right_kernel().basis_matrix()
+    elif G is not None and y is not None:
+        Fqm = G.base_ring()
+        y = vector(Fqm, y)
+        
+        H = G.right_kernel().basis_matrix()
+        s = H * y
+    else:
+        raise ValueError("Decoder requires either an RSD instance (H, s) or an RD instance (G, y).")
+        
+    V_Fq = Fqm.vector_space(map=False)
+
+    # Feasibility and bound calculation 
+    
+    mu = H.nrows()
+    t = len(J)
+    
+    dmax = min(m, int(floor((m * mu + t) / n)))
+
+    if dmax < r:
+        print(f"Infeasible instance. dmax ({dmax}) < target rank r ({r}).")
+        return []
+
+
+    # Select a working super-support dimension d from the valid range {r, ..., dmax}
+    d = r
+
+    # variables calculation
+    if B_sup is None:
+        # Calculate p_sup(d) using the formal quotient of Gaussian binomial coefficients
+        num_coeff = _gaussian_binomial(m - r, d - r, q)
+        den_coeff = _gaussian_binomial(m, d, q)
+        
+        if den_coeff > 0:
+            p_sup = num_coeff / den_coeff
+        else:
+            p_sup = 1.0
+            
+        # Dynamically set B_sup budget using target failure probability threshold epsilon
+        if p_sup < 1.0 and p_sup > 0:
+            B_sup = int(ceil(log(epsilon) / log(1 - p_sup)))
+        else:
+            B_sup = 1
+    
+    E_GRS = []
+    VS_Fq = VectorSpace(Fq, m)
+    
+    T_scalar = []
+    a_T_scalar = {}
+    for idx, col_idx in enumerate(J):
+        for bit_pos in range(m):
+            T_scalar.append((col_idx, bit_pos))
+            a_T_scalar[(col_idx, bit_pos)] = Fq(V_Fq(a_J[idx])[bit_pos])
+
+    for trial in range(B_sup):
+        support_basis_vectors = []
+        while len(support_basis_vectors) < d:
+            rand_vec = VS_Fq.random_element()
+            if rand_vec != 0 and rand_vec not in VS_Fq.subspace(support_basis_vectors):
+                support_basis_vectors.append(rand_vec)
+                
+        support_basis = [Fqm(vec) for vec in support_basis_vectors]
+        
+        # Algorithm 2
+        E_F, equations, beta_matrix, R_poly = grs_scalar_erasures(
+            q, m, n, d, support_basis, Fqm, H, s, T_scalar, a_T_scalar, r, B_rec
+        )
+        
+        for cand in E_F:
+            if cand not in E_GRS:
+                E_GRS.append(cand)
+
+
+    # Filter accumulated error candidates against global problem boundaries 
+    E_out = []
+    for cand_vec in E_GRS:
+        if H * cand_vec == s:
+            cand_matrix = matrix(Fq, [V_Fq(el) for el in cand_vec]).transpose()
+            if cand_matrix.rank() == r:
+                E_out.append(cand_vec)
+                
+    return E_out
