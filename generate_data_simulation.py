@@ -9,17 +9,18 @@ configurations = [
     {"n": 7,  "k": 3,  "r": 2,  "m": 4},
     {"n": 15, "k": 7,  "r": 5,  "m": 15},
     {"n": 33, "k": 15, "r": 10, "m": 31}
-instances_per_config = 20
+]
+instances_per_config = 50
 max_attempts = 300  # Bounded iteration threshold to prevent infinite loops
 
-# Target output directory setup
+# Target output directory setup (Volvemos a generated_data)
 output_dir = "generated_data"
 if not os.path.exists(output_dir):
     os.makedirs(output_dir)
 
 Fq = GF(q)
 
-print(f"--- Starting Bounded Pipeline: Writing 20 Instances per Config to '{output_dir}/' ---")
+print(f"--- Starting Portable JSON Pipeline: Writing 20 Instances per Config to '{output_dir}/' ---")
 
 for config in configurations:
     n, k, r, m = config["n"], config["k"], config["r"], config["m"]
@@ -27,7 +28,7 @@ for config in configurations:
     
     print(f"\nProcessing configuration: n={n}, k={k}, r={r} over extension field m={m}")
     
-    # Instantiate large field environments with deprecation safeguards
+    # Instantiate large field environments
     Fqm = GF(q**m, name='z')
     V_Fq = Fqm.vector_space(map=False)  # map=False suppresses Sage free_module warnings
     VS_base = VectorSpace(Fq, m)
@@ -46,7 +47,6 @@ for config in configurations:
                 H_mat = test_H
                 sampled_H = True
                 break
-        
         if not sampled_H:
             raise RuntimeError(f"Critical Error: Failed to find full rank H after {max_attempts} attempts.")
 
@@ -64,7 +64,7 @@ for config in configurations:
                     support_basis.append(elem)
             
             if len(support_basis) < r:
-                continue  # Try the whole generation cycle again if subspace construction stalls
+                continue
             
             # Populate error vector via random Fq combinations of the support basis elements
             e_list = []

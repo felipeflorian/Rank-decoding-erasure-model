@@ -241,30 +241,24 @@ def compute_bitwise_posteriors(obs_bit, rho, alpha=0.01, beta=0.20):
 
 def simulate_and_analyze_leakage(E, Fqm, r, q, m, n, alpha=0.01, beta=0.20):
     """
-    Simulates asymmetric cold-boot bit leakage over the coordinates of the matrix E
-    and computes full extension-field entry posteriors using bitwise factorization.
+    Versión optimizada para cuerpos gigantes (m=31). 
+    Elimina list(Fqm) para evitar el error 'Killed' por falta de memoria RAM.
     """
     V_Fq = Fqm.vector_space(map=False)
     Fq = GF(q)
-    
-    # Calculate global prior rho = target_rank_weight / code_length as specified
     rho = float(r / n)
-    
-    all_elements = list(Fqm)
-    element_to_bits = {el: tuple(V_Fq(el)) for el in all_elements}
     
     # --- Step A: Simulate Asymmetric Cold-Boot Physical Noise ---
     e_tilde_list = []
     bit_leakage_matrix = [] 
     
-    # Process the matrix column-by-column (E.column(j))
     for j in range(n):
         true_bits = E.column(j)
         observed_bits = []
         for bit in true_bits:
             if bit == 1:
                 obs = Fq(1) if random.random() >= alpha else Fq(0)
-            else:
+            elif bit == 0:
                 obs = Fq(0) if random.random() >= beta else Fq(1)
             observed_bits.append(obs)
             
@@ -274,31 +268,34 @@ def simulate_and_analyze_leakage(E, Fqm, r, q, m, n, alpha=0.01, beta=0.20):
     E_tilde_vector = vector(Fqm, e_tilde_list)
     E_tilde_matrix = matrix(Fq, bit_leakage_matrix).transpose()
     
-    # --- Step B: Calculate Entry-Wise Posteriors and Sort Columns ---
-    posteriors = []
-    for j in range(n):
-        column_posteriors = {}
-        
-        for element in all_elements:
-            candidate_bits = element_to_bits[element]
-            column_weight = 1.0
-            
-            for l in range(m):
-                obs_b = int(bit_leakage_matrix[j][l])
-                cand_b = int(candidate_bits[l])
-                
-                p_0, p_1 = compute_bitwise_posteriors(obs_b, rho, alpha, beta)
-                column_weight *= p_1 if cand_b == 1 else p_0
-                
-            column_posteriors[element] = column_weight
-            
-        posteriors.append(column_posteriors)
-        
-    # Evaluate Maximum A Posteriori (MAP) confidence profiles
-    column_scores = [(j, max(posteriors[j].values())) for j in range(n)]
-    sorted_cols = sorted(column_scores, key=lambda x: x[1], reverse=True)
+    # --- Step B: Calculate Entry-Wise Posteriors sin usar fuerza bruta del cuerpo ---
+    posteriors = {}  
+    bit_posteriors_list = [[] for _ in range(m)]
     
-    return E_tilde_vector, E_tilde_matrix, posteriors, sorted_cols
+    for j in range(n):
+        noisy_bits = E_tilde_matrix.column(j)
+        column_weight = 1.0
+        
+        for l in range(m):
+            obs_b = int(noisy_bits[l])
+            
+            p_0, p_1 = compute_bitwise_posteriors(obs_b, rho, alpha, beta)
+            column_weight *= p_1 if obs_b == 1 else p_0
+            
+            # Guardamos la probabilidad marginal basándonos en el bit observado
+            bit_posterior_value = p_1 if obs_b == 1 else p_0
+            bit_posteriors_list[l].append(float(bit_posterior_value))
+            
+        column_string = str([int(bit) for bit in noisy_bits])
+        
+        # En el diccionario guardamos el score de verosimilitud de la columna observada
+        posteriors[j] = (float(column_weight), column_string)
+        
+    # Ordenamos las columnas según la métrica acumulada de sus bits observados
+    sorted_cols = sorted(posteriors.keys(), key=lambda idx: posteriors[idx][0], reverse=True)
+    posterior_matrix = bit_posteriors_list
+    
+    return E_tilde_vector, E_tilde_matrix, posteriors, sorted_cols, posterior_matrix
 
 def grs_scalar_erasures(q, m, n, d, support_basis, Fqm, H, s, T, a_T, r, B_rec=128):
     
