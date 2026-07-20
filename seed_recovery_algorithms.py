@@ -2,11 +2,8 @@ import math
 from collections import defaultdict
 from functools import lru_cache
 from itertools import product
-from math import log
 from bitarray import bitarray
-from basic_enumerator import BasicKeyEnumerator
 from candidate import ChunkCandidate
-from enumeration_utils import combine
 from okeanode import initialize
 
 def build_posteriors_from_tilde(s_tilde, alpha, beta):
@@ -39,56 +36,6 @@ def build_posteriors_from_tilde(s_tilde, alpha, beta):
             ])
     return P
 
-def posterior_probability(observed_bit, candidate_bit, alpha, beta):
-    """
-        Calcula la probabilidad P(s* = candidate_bit | observed_bit) bajo el modelo CBPM para Cold Boot Attacks.
-        
-        Parámetros:
-        - observed_bit: bit observado desde memoria (0 o 1), es decir, \tilde{s}_j
-        - candidate_bit: valor que se quiere evaluar como el original s*_j (0 o 1)
-        - alpha: probabilidad de flip de 0 a 1
-        - beta: probabilidad de flip de 1 a 0
-
-        Retorna:
-        - Probabilidad condicional P(s*_j = candidate_bit | \tilde{s}_j)
-    """
-
-    if observed_bit == 0:
-        if candidate_bit == 0:
-            return (1 - alpha) / (1 - alpha + beta)
-        else:  # candidate_bit == 1
-            return beta / (1 - alpha + beta)
-    elif observed_bit == 1:
-        if candidate_bit == 0:
-            return alpha / (alpha + (1 - beta))
-        else:  # candidate_bit == 1
-            return (1 - beta) / (alpha + (1 - beta))
-    else:
-        raise ValueError("observed_bit debe ser 0 o 1")
-
-    """
-    Calcula el log-likelihood score de una semilla candidata bajo el modelo CBPM.
-
-    Parámetros:
-    - candidate_bits: lista de bits candidatos, ej: [0, 1, 0, 1, ...]
-    - observed_bits: lista de bits observados desde la memoria, misma longitud
-    - alpha: probabilidad de flip de 0 a 1
-    - beta: probabilidad de flip de 1 a 0
-
-    Retorna:
-    - Score (log-likelihood total)
-    """
-
-    if len(candidate_bits) != len(observed_bits):
-        raise ValueError("candidate_bits y observed_bits deben tener la misma longitud")
-
-    score = 0.0
-    for cj, sj in zip(candidate_bits, observed_bits):
-        prob = posterior_probability(observed_bit=sj, candidate_bit=cj, alpha=alpha, beta=beta)
-        score += math.log(prob)
-
-    return score
-
 def extract_chunk(seed: bitarray, start: int, end: int) -> bitarray:
     return seed[start:end]
 
@@ -99,10 +46,17 @@ def safe_log(x):
 @lru_cache(maxsize=32)
 def get_bit_combinations(w):
     """
-    Devuelve todas las combinaciones posibles de bits de longitud w.
-    Usa cache para evitar recomputarlas si ya se han calculado antes.
+        Returns all possible bit combinations of length w.
+        Uses a cache to avoid recomputing them if they have been calculated before.
+
+        Input:
+            - w: int defining the bit width of a chunk to expand
+
+        Output:
+            - A list of tuples containing all possible binary value combinations of length w
     """
     return list(product([0, 1], repeat=w))
+
 
 def generate_candidates(P, W, w, eta, mu, scale=10000.0):
 
@@ -136,8 +90,7 @@ def generate_candidates(P, W, w, eta, mu, scale=10000.0):
         start = i * w
         end = start + w
         P_chunk = P[start:end]
-
-        logs = [(safe_log(p0), safe_log(p1)) for (p0, p1) in P_chunk]
+        logs = [(safe_log(float(p0)), safe_log(float(p1))) for (p0, p1) in P_chunk]
 
         candidates = []
         for bits in get_bit_combinations(w):
@@ -195,7 +148,12 @@ def create(L, B1, B2, W, w, eta, mu, scale=10000):
 
     # Precalculate integer weights per block
     weights_by_block = [
-        [cand.to_weight(scale) for cand in block]
+        [
+            cand.to_weight(
+                scale=10 ** (-math.floor(math.log10(abs(cand.score))))
+            )
+            for cand in block
+        ]
         for block in L
     ]
 
@@ -226,7 +184,7 @@ def create(L, B1, B2, W, w, eta, mu, scale=10000):
     return B
 
 
-def rank(L, B, B1, B2, W, w, eta, mu):
+def rank(L, B1, B2, W, w, eta, mu):
     
     """
         (Algorithm 3) Computes the total number of full-length seed candidates whose cumulative 
@@ -281,11 +239,15 @@ def getSeed(L, B, B1, B2, W, w, eta, mu, r):
     b = 0 # Current prefix score
 
     # Traverse the DP matrix backwards from the second-to-last block
-    for i in range(xi-2):
-        for j in range(mu-1):
-            sc = L[i][j].score # Get the score of the current chunk candidate
+    for i in range(xi-1):
+        for j in range(mu):
+            scale = 10 ** (-math.floor(math.log10(abs(L[i][j].score))))
+            sc = L[i][j].to_weight(scale=scale) # Get the score of the current chunk candidate
+            
+            # print(f"este es sc primer for: {sc}")
+            # print(L[i][j].score)
             if r <= B[i+1][b + sc]: # Check if the current rank falls within the current candidate's range
-                seed_r += L[i][j].candidate.to01() # Append the current candidate's bitstring to the seed
+                seed_r += L[i][j].bits.to01() # Append the current candidate's bitstring to the seed
                 b += sc
                 break
             r -= B[i+1][b + sc]
@@ -293,10 +255,12 @@ def getSeed(L, B, B1, B2, W, w, eta, mu, r):
     # --- Base: last block (i = xi - 1) ---
     i_new = xi - 1
     for j in range(mu):
-        sc = L[i_new][j].score # Get the score of the current chunk candidate
+        scale = 10 ** (-math.floor(math.log10(abs(L[i_new][j].score))))
+        sc = L[i_new][j].to_weight(scale=scale) # Get the score of the current chunk candidate
         x = 1 if B1-b <= sc < B2-b else 0 # Check if the current rank falls within the current candidate's range
-        if r <= B[i_new][b + sc]: # Check if the current rank falls within the current candidate's range
-            seed_r += L[i_new][j].candidate.to01()
+        if r <= x: # Check if the current rank falls within the current candidate's range
+            seed_r += L[i_new][j].bits.to01()
+            break
         
         r = r - x
 

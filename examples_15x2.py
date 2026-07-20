@@ -2,7 +2,7 @@ from okeanode import random_chunk_candidates, initialize
 
 
 # Generate 15 chunk lists, each with 2 candidates of 4 bits
-chunk_lists = [random_chunk_candidates(2, 8) for _ in range(8)]
+chunk_lists = [random_chunk_candidates(2, 4) for _ in range(8)]
 
 print(chunk_lists)
 # Build OKEA tree
