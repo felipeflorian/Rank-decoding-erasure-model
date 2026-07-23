@@ -206,6 +206,45 @@ def rank(L, B1, B2, W, w, eta, mu):
     B = create(L, B1, B2, W, w, eta, mu)
     return B[0][0]
 
+def findOptimalB2(L, B1, Bmax, W, w, eta, mu, Btime, Bmemory, Cbase, Cblock, Coracle, scale=10000):
+    """
+    Búsqueda binaria de B2 con el modelo EXACTO del paper:
+
+        M = μ·W + ξ·μ·log2(Bmax) + (W/(η·w))·B2·ceil(ξ·log2(μ))
+          = μ·W + ξ·μ·log2(Bmax) + ξ·B2·ceil(ξ·log2(μ)),  con  ξ = W/(η·w)
+
+    Tiempo:
+        T = Ncands · (Cbase + μ·ξ·Cblock + Coracle)
+    """
+    # ξ = W/(η·w)
+    N = W // w
+    xi = N // eta
+
+    # anchuras (exactas según paper)
+    log2_Bmax = math.log2(Bmax)                      # ← sin ceil, ni clamps
+    ceil_xi_log2_mu = math.ceil(xi * math.log2(mu))  # ← solo aquí hay ceil
+
+    low, high = B1, Bmax
+    best_B2 = None
+
+    while low <= high:
+        mid = (low + high) // 2
+
+        # construir B y contar candidatos en [B1, mid)
+        B = create(L, B1, mid, W, w, eta, mu, scale)
+        Ncands = B[0][0]
+
+        # tiempo y memoria (paper)
+        T = Ncands * (Cbase + mu * xi * Cblock + Coracle)
+        M = (mu * W) + (xi * mu * log2_Bmax) + (xi * mid * ceil_xi_log2_mu)
+
+        if T <= Btime and M <= Bmemory:
+            best_B2 = mid
+            low = mid + 1
+        else:
+            high = mid - 1
+
+    return best_B2
 
 def getSeed(L, B, B1, B2, W, w, eta, mu, r):
 
